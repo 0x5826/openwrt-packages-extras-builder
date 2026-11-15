@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       openwrt_25_ver:
-        description: 'OpenWrt 25.x version (apk)'
+        description: 'OpenWrt 25.x version (apk + ipk)'
         default: '25.12.6'
       openwrt_24_ver:
         description: 'OpenWrt 24.x version (ipk)'
@@ -26,7 +26,7 @@ jobs:
       legacy_sha: ${{ steps.upstream.outputs.legacy_sha }}
       should_build: ${{ steps.upstream.outputs.should_build }}
     steps:
-      - name: Check upstream commits and latest release tag
+      - name: Check upstream commits and latest release title
         id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -36,9 +36,9 @@ jobs:
           echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
           echo "legacy_sha=$LEGACY_SHA" >> "$GITHUB_OUTPUT"
 
-          LATEST_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName -q '.[0].tagName' || true)
-          TARGET_TAG="build-${MAIN_SHA}-${LEGACY_SHA}"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$LATEST_TAG" != "$TARGET_TAG" ]; then
+          LATEST_TITLE=$(gh release view latest --repo "${{ github.repository }}" --json name -q '.name' 2>/dev/null || true)
+          TARGET_TITLE="OpenWrt Packages (main:${MAIN_SHA} | 21.02:${LEGACY_SHA})"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$LATEST_TITLE" != "$TARGET_TITLE" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -47,7 +47,7 @@ jobs:
   build:
     needs: check-updates
     if: needs.check-updates.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +60,7 @@ jobs:
             subtarget: '64'
             arch_label: 'x86_64'
             include_noarch: 'true'
+            runner: 'ubuntu-latest'
           - openwrt_ver: '25.12.6'
             pkg_format: 'apk'
             feed_branch: 'main'
@@ -67,6 +68,7 @@ jobs:
             subtarget: 'armv8'
             arch_label: 'aarch64_generic'
             include_noarch: 'false'
+            runner: 'ubuntu-latest'
           - openwrt_ver: '25.12.6'
             pkg_format: 'apk'
             feed_branch: 'main'
@@ -74,6 +76,33 @@ jobs:
             subtarget: 'filogic'
             arch_label: 'aarch64_cortex-a53'
             include_noarch: 'false'
+            runner: 'ubuntu-latest'
+
+          # OpenWrt 25.12 (IPK)
+          - openwrt_ver: '25.12.6'
+            pkg_format: 'ipk'
+            feed_branch: 'main'
+            target: 'x86'
+            subtarget: '64'
+            arch_label: 'x86_64'
+            include_noarch: 'true'
+            runner: 'ubuntu-latest'
+          - openwrt_ver: '25.12.6'
+            pkg_format: 'ipk'
+            feed_branch: 'main'
+            target: 'armsr'
+            subtarget: 'armv8'
+            arch_label: 'aarch64_generic'
+            include_noarch: 'false'
+            runner: 'ubuntu-latest'
+          - openwrt_ver: '25.12.6'
+            pkg_format: 'ipk'
+            feed_branch: 'main'
+            target: 'mediatek'
+            subtarget: 'filogic'
+            arch_label: 'aarch64_cortex-a53'
+            include_noarch: 'false'
+            runner: 'ubuntu-latest'
 
           # OpenWrt 24.10 (IPK)
           - openwrt_ver: '24.10.8'
@@ -83,6 +112,7 @@ jobs:
             subtarget: '64'
             arch_label: 'x86_64'
             include_noarch: 'true'
+            runner: 'ubuntu-latest'
           - openwrt_ver: '24.10.8'
             pkg_format: 'ipk'
             feed_branch: 'main'
@@ -90,6 +120,7 @@ jobs:
             subtarget: 'armv8'
             arch_label: 'aarch64_generic'
             include_noarch: 'false'
+            runner: 'ubuntu-latest'
           - openwrt_ver: '24.10.8'
             pkg_format: 'ipk'
             feed_branch: 'main'
@@ -97,6 +128,7 @@ jobs:
             subtarget: 'filogic'
             arch_label: 'aarch64_cortex-a53'
             include_noarch: 'false'
+            runner: 'ubuntu-latest'
 
           # OpenWrt 21.02 (IPK)
           - openwrt_ver: '21.02.7'
@@ -106,6 +138,7 @@ jobs:
             subtarget: '64'
             arch_label: 'x86_64'
             include_noarch: 'true'
+            runner: 'ubuntu-24.04'
           - openwrt_ver: '21.02.7'
             pkg_format: 'ipk'
             feed_branch: 'openwrt-21.02'
@@ -113,6 +146,7 @@ jobs:
             subtarget: 'armv8'
             arch_label: 'aarch64_generic'
             include_noarch: 'false'
+            runner: 'ubuntu-24.04'
           - openwrt_ver: '21.02.7'
             pkg_format: 'ipk'
             feed_branch: 'openwrt-21.02'
@@ -120,6 +154,7 @@ jobs:
             subtarget: 'mt7622'
             arch_label: 'aarch64_cortex-a53'
             include_noarch: 'false'
+            runner: 'ubuntu-24.04'
 
     steps:
       - name: Free runner disk space
@@ -166,6 +201,20 @@ jobs:
         working-directory: sdk
         run: |
           make defconfig
+
+          # 禁用 SDK 默认全量编包与全量内核模块，避免无关 kmod 拖慢构建
+          sed -i -E '/^CONFIG_ALL(_KMODS|_NONSHARED)?=y$/d' .config
+          {
+            echo '# CONFIG_ALL is not set'
+            echo '# CONFIG_ALL_KMODS is not set'
+            echo '# CONFIG_ALL_NONSHARED is not set'
+          } >> .config
+
+          if [ "${{ matrix.pkg_format }}" = "ipk" ]; then
+            sed -i '/^CONFIG_USE_APK=y$/d' .config
+            echo '# CONFIG_USE_APK is not set' >> .config
+          fi
+
           awk '
             /^Source-Makefile:[[:space:]]*(package\/)?feeds\/dante_extras\// { in_feed=1; next }
             /^Source-Makefile:/ { in_feed=0; next }
@@ -178,12 +227,14 @@ jobs:
           ' tmp/.packageinfo >> .config
           make defconfig
 
+          PKG_TARGETS=()
           for pkg_dir in feeds/dante_extras/*/; do
             [ -f "${pkg_dir}Makefile" ] || continue
             pkg=$(basename "$pkg_dir")
-            echo "=== Building $pkg ==="
-            make "package/feeds/dante_extras/${pkg}/compile" -j"$(nproc)" V=s
+            PKG_TARGETS+=("package/feeds/dante_extras/${pkg}/compile")
           done
+          echo "=== Building ${#PKG_TARGETS[@]} packages ==="
+          make "${PKG_TARGETS[@]}" -j"$(nproc)" V=s
 
       - name: Collect built packages
         run: |
@@ -250,16 +301,15 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Generate SHA256SUMS and publish GitHub Release
+      - name: Generate SHA256SUMS and publish latest Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd artifacts
           sha256sum *.tar.gz > SHA256SUMS.txt
-          TAG="build-${{ needs.check-updates.outputs.main_sha }}-${{ needs.check-updates.outputs.legacy_sha }}"
-          TITLE="OpenWrt Packages (${TAG})"
-          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
-          gh release create "$TAG" *.tar.gz SHA256SUMS.txt \
+          TITLE="OpenWrt Packages (main:${{ needs.check-updates.outputs.main_sha }} | 21.02:${{ needs.check-updates.outputs.legacy_sha }})"
+          gh release delete latest --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest *.tar.gz SHA256SUMS.txt \
             --repo "${{ github.repository }}" \
             --title "$TITLE" \
             --notes "Built from https://github.com/0x5826/openwrt-packages-extras (main: ${{ needs.check-updates.outputs.main_sha }}, openwrt-21.02: ${{ needs.check-updates.outputs.legacy_sha }})."
