@@ -1,0 +1,265 @@
+name: Build OpenWrt Packages (.apk & .ipk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_25_ver:
+        description: 'OpenWrt 25.x version (apk)'
+        default: '25.12.6'
+      openwrt_24_ver:
+        description: 'OpenWrt 24.x version (ipk)'
+        default: '24.10.8'
+      openwrt_21_ver:
+        description: 'OpenWrt 21.x version (ipk)'
+        default: '21.02.7'
+  schedule:
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    outputs:
+      main_sha: ${{ steps.upstream.outputs.main_sha }}
+      legacy_sha: ${{ steps.upstream.outputs.legacy_sha }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+    steps:
+      - name: Check upstream commits and latest release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MAIN_SHA=$(git ls-remote https://github.com/0x5826/openwrt-packages-extras.git refs/heads/main | awk '{print substr($1,1,7)}')
+          LEGACY_SHA=$(git ls-remote https://github.com/0x5826/openwrt-packages-extras.git refs/heads/openwrt-21.02 | awk '{print substr($1,1,7)}')
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "legacy_sha=$LEGACY_SHA" >> "$GITHUB_OUTPUT"
+
+          LATEST_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName -q '.[0].tagName' || true)
+          TARGET_TAG="build-${MAIN_SHA}-${LEGACY_SHA}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$LATEST_TAG" != "$TARGET_TAG" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-updates
+    if: needs.check-updates.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # OpenWrt 25.12 (APK)
+          - openwrt_ver: '25.12.6'
+            pkg_format: 'apk'
+            feed_branch: 'main'
+            target: 'x86'
+            subtarget: '64'
+            arch_label: 'x86_64'
+            include_noarch: 'true'
+          - openwrt_ver: '25.12.6'
+            pkg_format: 'apk'
+            feed_branch: 'main'
+            target: 'armsr'
+            subtarget: 'armv8'
+            arch_label: 'aarch64_generic'
+            include_noarch: 'false'
+          - openwrt_ver: '25.12.6'
+            pkg_format: 'apk'
+            feed_branch: 'main'
+            target: 'mediatek'
+            subtarget: 'filogic'
+            arch_label: 'aarch64_cortex-a53'
+            include_noarch: 'false'
+
+          # OpenWrt 24.10 (IPK)
+          - openwrt_ver: '24.10.8'
+            pkg_format: 'ipk'
+            feed_branch: 'main'
+            target: 'x86'
+            subtarget: '64'
+            arch_label: 'x86_64'
+            include_noarch: 'true'
+          - openwrt_ver: '24.10.8'
+            pkg_format: 'ipk'
+            feed_branch: 'main'
+            target: 'armsr'
+            subtarget: 'armv8'
+            arch_label: 'aarch64_generic'
+            include_noarch: 'false'
+          - openwrt_ver: '24.10.8'
+            pkg_format: 'ipk'
+            feed_branch: 'main'
+            target: 'mediatek'
+            subtarget: 'filogic'
+            arch_label: 'aarch64_cortex-a53'
+            include_noarch: 'false'
+
+          # OpenWrt 21.02 (IPK)
+          - openwrt_ver: '21.02.7'
+            pkg_format: 'ipk'
+            feed_branch: 'openwrt-21.02'
+            target: 'x86'
+            subtarget: '64'
+            arch_label: 'x86_64'
+            include_noarch: 'true'
+          - openwrt_ver: '21.02.7'
+            pkg_format: 'ipk'
+            feed_branch: 'openwrt-21.02'
+            target: 'rockchip'
+            subtarget: 'armv8'
+            arch_label: 'aarch64_generic'
+            include_noarch: 'false'
+          - openwrt_ver: '21.02.7'
+            pkg_format: 'ipk'
+            feed_branch: 'openwrt-21.02'
+            target: 'mediatek'
+            subtarget: 'mt7622'
+            arch_label: 'aarch64_cortex-a53'
+            include_noarch: 'false'
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget zstd jq curl
+
+      - name: Download and extract OpenWrt SDK
+        id: sdk
+        run: |
+          VER="${{ matrix.openwrt_ver }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "${{ matrix.openwrt_ver }}" in
+              25.*) VER="${{ github.event.inputs.openwrt_25_ver || matrix.openwrt_ver }}" ;;
+              24.*) VER="${{ github.event.inputs.openwrt_24_ver || matrix.openwrt_ver }}" ;;
+              21.*) VER="${{ github.event.inputs.openwrt_21_ver || matrix.openwrt_ver }}" ;;
+            esac
+          fi
+          BASE_URL="https://downloads.openwrt.org/releases/${VER}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
+          SDK_FILE=$(curl -fsSL "${BASE_URL}/" | grep -oE 'openwrt-sdk-[^"<]+\.tar\.(zst|xz)' | head -n1)
+          test -n "$SDK_FILE"
+          echo "Downloading ${BASE_URL}/${SDK_FILE}..."
+          curl -fL --retry 3 -o "${SDK_FILE}" "${BASE_URL}/${SDK_FILE}"
+          mkdir -p sdk
+          tar -xf "${SDK_FILE}" -C sdk --strip-components=1
+          rm -f "${SDK_FILE}"
+          echo "openwrt_ver=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure and update feeds
+        working-directory: sdk
+        run: |
+          cp feeds.conf.default feeds.conf
+          echo "src-git dante_extras https://github.com/0x5826/openwrt-packages-extras.git;${{ matrix.feed_branch }}" >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a -p dante_extras
+
+      - name: Select packages and compile
+        working-directory: sdk
+        run: |
+          make defconfig
+          awk '
+            /^Source-Makefile:[[:space:]]*(package\/)?feeds\/dante_extras\// { in_feed=1; next }
+            /^Source-Makefile:/ { in_feed=0; next }
+            in_feed && /^Package:[[:space:]]+/ {
+              pkg=$2
+              if (pkg !~ /^luci-i18n-/ || pkg ~ /-zh-cn$/) {
+                print "CONFIG_PACKAGE_" pkg "=m"
+              }
+            }
+          ' tmp/.packageinfo >> .config
+          make defconfig
+
+          for pkg_dir in feeds/dante_extras/*/; do
+            [ -f "${pkg_dir}Makefile" ] || continue
+            pkg=$(basename "$pkg_dir")
+            echo "=== Building $pkg ==="
+            make "package/feeds/dante_extras/${pkg}/compile" -j"$(nproc)" V=s
+          done
+
+      - name: Collect built packages
+        run: |
+          mkdir -p dist/arch dist/noarch
+          PKG_EXT="${{ matrix.pkg_format }}"
+
+          first_apk_inspected=0
+          while IFS= read -r f; do
+            is_noarch=0
+            case "$f" in
+              */noarch/*|*_all.ipk)
+                is_noarch=1
+                ;;
+            esac
+
+            if [ "$is_noarch" -eq 0 ] && [ "$PKG_EXT" = "apk" ] && [ -x sdk/staging_dir/host/bin/apk ]; then
+              if [ "$first_apk_inspected" -eq 0 ]; then
+                echo "=== Sample apk adbdump ($f) ==="
+                sdk/staging_dir/host/bin/apk adbdump "$f" 2>/dev/null | head -n 30 || true
+                first_apk_inspected=1
+              fi
+              if sdk/staging_dir/host/bin/apk adbdump "$f" 2>/dev/null | grep -Eq '^[[:space:]]*arch:[[:space:]]*(noarch|all)$'; then
+                is_noarch=1
+              fi
+            fi
+
+            if [ "$is_noarch" -eq 1 ]; then
+              [ "${{ matrix.include_noarch }}" = "true" ] && cp -f "$f" dist/noarch/
+            else
+              cp -f "$f" dist/arch/
+            fi
+          done < <(find sdk/bin/packages -type f -path "*/dante_extras/*.${PKG_EXT}")
+
+          echo "=== arch packages ==="
+          ls -lh dist/arch/ || true
+          echo "=== noarch packages ==="
+          ls -lh dist/noarch/ || true
+
+      - name: Package artifacts for upload
+        run: |
+          OUT_DIR="release-assets"
+          mkdir -p "$OUT_DIR"
+          PREFIX="openwrt-${{ steps.sdk.outputs.openwrt_ver }}-${{ matrix.feed_branch }}-${{ matrix.pkg_format }}"
+          if [ -n "$(ls -A dist/arch)" ]; then
+            tar -czf "${OUT_DIR}/${PREFIX}-${{ matrix.arch_label }}.tar.gz" -C dist/arch .
+          fi
+          if [ "${{ matrix.include_noarch }}" = "true" ] && [ -n "$(ls -A dist/noarch)" ]; then
+            tar -czf "${OUT_DIR}/${PREFIX}-noarch.tar.gz" -C dist/noarch .
+          fi
+
+      - name: Upload job artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgs-${{ matrix.openwrt_ver }}-${{ matrix.feed_branch }}-${{ matrix.pkg_format }}-${{ matrix.arch_label }}
+          path: release-assets/
+
+  release:
+    needs: [check-updates, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          TAG="build-${{ needs.check-updates.outputs.main_sha }}-${{ needs.check-updates.outputs.legacy_sha }}"
+          TITLE="OpenWrt Packages (${TAG})"
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          gh release create "$TAG" *.tar.gz SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --notes "Built from https://github.com/0x5826/openwrt-packages-extras (main: ${{ needs.check-updates.outputs.main_sha }}, openwrt-21.02: ${{ needs.check-updates.outputs.legacy_sha }})."
