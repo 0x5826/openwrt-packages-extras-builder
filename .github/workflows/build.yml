@@ -26,7 +26,7 @@ jobs:
       legacy_sha: ${{ steps.upstream.outputs.legacy_sha }}
       should_build: ${{ steps.upstream.outputs.should_build }}
     steps:
-      - name: Check upstream commits and latest release title
+      - name: Check upstream commits and latest release titles
         id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -36,9 +36,14 @@ jobs:
           echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
           echo "legacy_sha=$LEGACY_SHA" >> "$GITHUB_OUTPUT"
 
-          LATEST_TITLE=$(gh release view latest --repo "${{ github.repository }}" --json name -q '.name' 2>/dev/null || true)
-          TARGET_TITLE="OpenWrt Packages (main:${MAIN_SHA} | 21.02:${LEGACY_SHA})"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$LATEST_TITLE" != "$TARGET_TITLE" ]; then
+          TITLE_25=$(gh release view latest-25.12 --repo "${{ github.repository }}" --json name -q '.name' 2>/dev/null || true)
+          TITLE_24=$(gh release view latest-24.10 --repo "${{ github.repository }}" --json name -q '.name' 2>/dev/null || true)
+          TITLE_21=$(gh release view latest-21.02 --repo "${{ github.repository }}" --json name -q '.name' 2>/dev/null || true)
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
+             [ "$TITLE_25" != "OpenWrt 25.12 Packages (main:${MAIN_SHA})" ] || \
+             [ "$TITLE_24" != "OpenWrt 24.10 Packages (main:${MAIN_SHA})" ] || \
+             [ "$TITLE_21" != "OpenWrt 21.02 Packages (21.02:${LEGACY_SHA})" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -180,14 +185,15 @@ jobs:
             esac
           fi
           BASE_URL="https://downloads.openwrt.org/releases/${VER}/targets/${{ matrix.target }}/${{ matrix.subtarget }}"
-          SDK_FILE=$(curl -fsSL "${BASE_URL}/" | grep -oE 'openwrt-sdk-[^"<]+\.tar\.(zst|xz)' | head -n1)
+          SDK_FILE=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/" | grep -oE 'openwrt-sdk-[^"<]+\.tar\.(zst|xz)' | head -n1)
           test -n "$SDK_FILE"
           echo "Downloading ${BASE_URL}/${SDK_FILE}..."
-          curl -fL --retry 3 -o "${SDK_FILE}" "${BASE_URL}/${SDK_FILE}"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o "${SDK_FILE}" "${BASE_URL}/${SDK_FILE}"
           mkdir -p sdk
           tar -xf "${SDK_FILE}" -C sdk --strip-components=1
           rm -f "${SDK_FILE}"
           echo "openwrt_ver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "series=${VER%.*}" >> "$GITHUB_OUTPUT"
 
       - name: Configure and update feeds
         working-directory: sdk
@@ -200,9 +206,19 @@ jobs:
       - name: Select packages and compile
         working-directory: sdk
         run: |
+          # 解除 SDK Config-build.in 中隐藏只读开关的强绑定，避免 make defconfig 还原 =y
+          if [ -f Config-build.in ]; then
+            awk -v pkg_fmt="${{ matrix.pkg_format }}" '
+              /^config[[:space:]]+/ { sym=$2 }
+              (sym=="ALL" || sym=="ALL_KMODS" || sym=="ALL_NONSHARED" || (pkg_fmt=="ipk" && sym=="USE_APK")) && /^[[:space:]]+default[[:space:]]+y([[:space:]]|$)/ {
+                sub(/default[[:space:]]+y/, "default n")
+              }
+              { print }
+            ' Config-build.in > Config-build.in.tmp && mv Config-build.in.tmp Config-build.in
+          fi
+
           make defconfig
 
-          # 禁用 SDK 默认全量编包与全量内核模块，避免无关 kmod 拖慢构建
           sed -i -E '/^CONFIG_ALL(_KMODS|_NONSHARED)?=y$/d' .config
           {
             echo '# CONFIG_ALL is not set'
@@ -226,6 +242,13 @@ jobs:
             }
           ' tmp/.packageinfo >> .config
           make defconfig
+
+          echo "=== Build config verification ==="
+          grep -E "CONFIG_USE_APK|CONFIG_ALL" .config || true
+          if [ "${{ matrix.pkg_format }}" = "ipk" ] && grep -q '^CONFIG_USE_APK=y$' .config; then
+            echo "ERROR: CONFIG_USE_APK=y is still active in ipk build!"
+            exit 1
+          fi
 
           PKG_TARGETS=()
           for pkg_dir in feeds/dante_extras/*/; do
@@ -273,16 +296,38 @@ jobs:
           echo "=== noarch packages ==="
           ls -lh dist/noarch/ || true
 
+          if [ -z "$(ls -A dist/arch)" ]; then
+            echo "ERROR: No .${PKG_EXT} arch packages collected!"
+            exit 1
+          fi
+          if [ "${{ matrix.include_noarch }}" = "true" ] && [ -z "$(ls -A dist/noarch)" ]; then
+            echo "ERROR: No .${PKG_EXT} noarch packages collected!"
+            exit 1
+          fi
+
       - name: Package artifacts for upload
         run: |
-          OUT_DIR="release-assets"
+          SERIES="${{ steps.sdk.outputs.series }}"
+          OUT_DIR="release-assets/${SERIES}"
           mkdir -p "$OUT_DIR"
           PREFIX="openwrt-${{ steps.sdk.outputs.openwrt_ver }}-${{ matrix.feed_branch }}-${{ matrix.pkg_format }}"
-          if [ -n "$(ls -A dist/arch)" ]; then
-            tar -czf "${OUT_DIR}/${PREFIX}-${{ matrix.arch_label }}.tar.gz" -C dist/arch .
-          fi
+          ARCH_LABEL="${{ matrix.arch_label }}"
+          PKG_EXT="${{ matrix.pkg_format }}"
+
+          tar -czf "${OUT_DIR}/${PREFIX}-${ARCH_LABEL}.tar.gz" -C dist/arch .
+          for f in dist/arch/*."${PKG_EXT}"; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            if [ "$PKG_EXT" = "apk" ]; then
+              cp -f "$f" "${OUT_DIR}/${base%.apk}_${ARCH_LABEL}.apk"
+            else
+              cp -f "$f" "${OUT_DIR}/${base}"
+            fi
+          done
+
           if [ "${{ matrix.include_noarch }}" = "true" ] && [ -n "$(ls -A dist/noarch)" ]; then
             tar -czf "${OUT_DIR}/${PREFIX}-noarch.tar.gz" -C dist/noarch .
+            cp -f dist/noarch/*."${PKG_EXT}" "${OUT_DIR}/"
           fi
 
       - name: Upload job artifacts
@@ -293,6 +338,7 @@ jobs:
 
   release:
     needs: [check-updates, build]
+    if: needs.check-updates.outputs.should_build == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -301,15 +347,33 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Generate SHA256SUMS and publish latest Release
+      - name: Generate SHA256SUMS and publish per-series rolling Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          shopt -s nullglob
           cd artifacts
-          sha256sum *.tar.gz > SHA256SUMS.txt
-          TITLE="OpenWrt Packages (main:${{ needs.check-updates.outputs.main_sha }} | 21.02:${{ needs.check-updates.outputs.legacy_sha }})"
-          gh release delete latest --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest *.tar.gz SHA256SUMS.txt \
-            --repo "${{ github.repository }}" \
-            --title "$TITLE" \
-            --notes "Built from https://github.com/0x5826/openwrt-packages-extras (main: ${{ needs.check-updates.outputs.main_sha }}, openwrt-21.02: ${{ needs.check-updates.outputs.legacy_sha }})."
+          for series in 25.12 24.10 21.02; do
+            [ -d "$series" ] || continue
+            (
+              cd "$series"
+              files=( *.apk *.ipk *.tar.gz )
+              [ "${#files[@]}" -gt 0 ] || exit 0
+              sha256sum "${files[@]}" > SHA256SUMS.txt
+
+              TAG="latest-${series}"
+              if [ "$series" = "21.02" ]; then
+                TITLE="OpenWrt ${series} Packages (21.02:${{ needs.check-updates.outputs.legacy_sha }})"
+                NOTES="Built from https://github.com/0x5826/openwrt-packages-extras (openwrt-21.02: ${{ needs.check-updates.outputs.legacy_sha }})."
+              else
+                TITLE="OpenWrt ${series} Packages (main:${{ needs.check-updates.outputs.main_sha }})"
+                NOTES="Built from https://github.com/0x5826/openwrt-packages-extras (main: ${{ needs.check-updates.outputs.main_sha }})."
+              fi
+
+              gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+              gh release create "$TAG" "${files[@]}" SHA256SUMS.txt \
+                --repo "${{ github.repository }}" \
+                --title "$TITLE" \
+                --notes "$NOTES"
+            )
+          done
