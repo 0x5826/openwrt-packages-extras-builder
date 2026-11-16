@@ -231,6 +231,13 @@ jobs:
             echo '# CONFIG_USE_APK is not set' >> .config
           fi
 
+          # 启用 LuCI 语言支持（简体中文）
+          {
+            echo "CONFIG_LUCI_LANG_zh_Hans=y"
+            echo "CONFIG_LUCI_LANG_zh-cn=y"
+            echo "CONFIG_LUCI_LANG_zh_CN=y"
+          } >> .config
+
           awk '
             /^Source-Makefile:[[:space:]]*(package\/)?feeds\/dante_extras\// { in_feed=1; next }
             /^Source-Makefile:/ { in_feed=0; next }
@@ -243,8 +250,19 @@ jobs:
           ' tmp/.packageinfo >> .config
           make defconfig
 
+          # 确保所有从 dante_extras 生成的中文语言包保持开启 (=m)
+          awk '
+            /^Source-Makefile:[[:space:]]*(package\/)?feeds\/dante_extras\// { in_feed=1; next }
+            /^Source-Makefile:/ { in_feed=0; next }
+            in_feed && /^Package:[[:space:]]+(luci-i18n-.*-zh-cn)$/ {
+              print "CONFIG_PACKAGE_" $2 "=m"
+            }
+          ' tmp/.packageinfo >> .config
+
           echo "=== Build config verification ==="
           grep -E "CONFIG_USE_APK|CONFIG_ALL" .config || true
+          echo "=== Selected i18n packages ==="
+          grep -E "CONFIG_PACKAGE_luci-i18n" .config || true
           if [ "${{ matrix.pkg_format }}" = "ipk" ] && grep -q '^CONFIG_USE_APK=y$' .config; then
             echo "ERROR: CONFIG_USE_APK=y is still active in ipk build!"
             exit 1
@@ -289,7 +307,7 @@ jobs:
             else
               cp -f "$f" dist/arch/
             fi
-          done < <(find sdk/bin/packages -type f -path "*/dante_extras/*.${PKG_EXT}")
+          done < <(find sdk/bin/packages -type f \( -path "*/dante_extras/*.${PKG_EXT}" -o -name "luci-i18n-*.${PKG_EXT}" \))
 
           echo "=== arch packages ==="
           ls -lh dist/arch/ || true
